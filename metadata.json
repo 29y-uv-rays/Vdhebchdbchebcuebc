@@ -1,0 +1,6 @@
+{
+  "name": "AI Chess & Game Coach",
+  "description": "Play against customizable AI bots with post-match deep move analysis, interactive walkthroughs, mistake puzzles, evaluation graphs, and AI coach explanations with Gemini & NVIDIA NIM support.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
