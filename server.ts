@@ -2,16 +2,31 @@ import express, { Request, Response } from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
+import { Chess } from 'chess.js';
 import dotenv from 'dotenv';
+import {
+  AnalyzeMoveRequestBody,
+  GameCoachSummaryRequestBody,
+  GameCoachSummaryResponse,
+  MoveCoachResponse,
+  getMoveCategories,
+  isValidGameCoachSummaryResponse,
+  isValidMoveCoachResponse,
+  validateAnalyzeMoveRequest,
+  validateGameCoachSummaryRequest,
+} from './src/engine/apiValidation';
+import { callNvidiaJson, extractJsonObject } from './src/engine/aiProvider';
 
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
+
+const DEFAULT_NIM_MODEL = 'meta/llama-3.1-70b-instruct';
+const GEMINI_MODEL = 'gemini-3.7-flash';
 
 app.use(express.json());
 
-// Initialize Gemini client (server-side only)
 let geminiClient: GoogleGenAI | null = null;
 function getGeminiClient(): GoogleGenAI | null {
   if (!geminiClient && process.env.GEMINI_API_KEY) {
@@ -20,15 +35,245 @@ function getGeminiClient(): GoogleGenAI | null {
       httpOptions: {
         headers: {
           'User-Agent': 'aistudio-build',
-        }
-      }
+        },
+      },
     });
   }
   return geminiClient;
 }
 
-// Health check
-app.get('/api/health', (req: Request, res: Response) => {
+type ProviderSource = 'nvidia-nim' | 'gemini' | 'heuristic';
+
+interface ProvenanceMeta {
+  source: ProviderSource;
+  model: string;
+  fallbackUsed: boolean;
+  fallbackReason: string | null;
+  warnings?: string[];
+}
+
+function withProvenance<T extends object>(payload: T, meta: ProvenanceMeta): T & ProvenanceMeta {
+  return {
+    ...payload,
+    ...meta,
+    warnings: meta.warnings && meta.warnings.length > 0 ? meta.warnings : undefined,
+  };
+}
+
+function sendValidationError(
+  res: Response,
+  code: string,
+  error: string,
+  details: Array<{ field: string; issue: string }>
+): Response {
+  return res.status(400).json({ error, code, details });
+}
+
+function formatEvalPawns(cp: number): string {
+  return (cp / 100).toFixed(2);
+}
+
+function classifySeverity(evalLossCp: number): string {
+  const absLoss = Math.max(0, evalLossCp);
+  if (absLoss <= 15) return 'excellent';
+  if (absLoss <= 40) return 'small-inaccuracy';
+  if (absLoss <= 90) return 'inaccuracy';
+  if (absLoss <= 200) return 'mistake';
+  return 'blunder';
+}
+
+function buildDeterministicMoveContext(input: {
+  color: 'w' | 'b';
+  sanPlayed: string;
+  bestSan: string;
+  evalBefore: number;
+  evalAfter: number;
+  evalLossCp: number;
+}): { severity: string; swingDirection: string; preSummary: string } {
+  const severity = classifySeverity(input.evalLossCp);
+  const deltaWhiteCp = input.evalAfter - input.evalBefore;
+  const playerDeltaCp = input.color === 'w' ? deltaWhiteCp : -deltaWhiteCp;
+  const swingDirection = playerDeltaCp > 0 ? 'improved' : playerDeltaCp < 0 ? 'worsened' : 'unchanged';
+  const preSummary = `Deterministic engine context: ${input.sanPlayed} vs ${input.bestSan}. Player eval change ${formatEvalPawns(
+    playerDeltaCp
+  )} pawns (${swingDirection}); centipawn loss ${Math.max(0, Math.round(input.evalLossCp))}; severity=${severity}.`;
+
+  return { severity, swingDirection, preSummary };
+}
+
+function createChessFromFen(fen: string): Chess | null {
+  try {
+    return new Chess(fen);
+  } catch {
+    return null;
+  }
+}
+
+function safeMove(chess: Chess, san: string) {
+  try {
+    return chess.move(san);
+  } catch {
+    return null;
+  }
+}
+
+function ensureLegalMove(fenBefore: string, san: string, field: 'sanPlayed' | 'bestSan'):
+  | { ok: true }
+  | { ok: false; detail: { field: string; issue: string } } {
+  const chess = createChessFromFen(fenBefore);
+  if (!chess) {
+    return { ok: false, detail: { field: 'fenBefore', issue: 'must be a valid FEN position' } };
+  }
+
+  const move = safeMove(chess, san);
+  if (!move) {
+    return {
+      ok: false,
+      detail: {
+        field,
+        issue: `illegal SAN move "${san}" for the provided position`,
+      },
+    };
+  }
+
+  return { ok: true };
+}
+
+function sanitizeConsequenceLine(fenBefore: string, line: string[] | undefined): { line: string[]; warnings: string[] } {
+  if (!line || line.length === 0) {
+    return { line: [], warnings: [] };
+  }
+
+  const chess = createChessFromFen(fenBefore);
+  if (!chess) {
+    return { line: [], warnings: [] };
+  }
+
+  const sanitized: string[] = [];
+  const warnings: string[] = [];
+
+  for (let i = 0; i < line.length; i++) {
+    const san = line[i].trim();
+    const move = safeMove(chess, san);
+    if (!move) {
+      warnings.push(`consequenceLine truncated at index ${i} due to illegal SAN move "${line[i]}".`);
+      break;
+    }
+    sanitized.push(move.san);
+  }
+
+  return { line: sanitized, warnings };
+}
+
+async function callGeminiMoveCoach(promptText: string): Promise<MoveCoachResponse> {
+  const ai = getGeminiClient();
+  if (!ai) {
+    throw new Error('Gemini API key is not configured.');
+  }
+
+  const response = await ai.models.generateContent({
+    model: GEMINI_MODEL,
+    contents: promptText,
+    config: {
+      systemInstruction:
+        'You are a world-class chess coach. Reply in strict JSON only, following the requested keys and category enum exactly.',
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          whatPlayed: { type: Type.STRING },
+          strongerMove: { type: Type.STRING },
+          whyBetter: { type: Type.STRING },
+          category: {
+            type: Type.STRING,
+            enum: [...getMoveCategories()],
+          },
+          principle: { type: Type.STRING },
+          consequenceSummary: { type: Type.STRING },
+          hint: { type: Type.STRING },
+        },
+        required: ['whatPlayed', 'strongerMove', 'whyBetter', 'category', 'principle', 'consequenceSummary', 'hint'],
+      },
+    },
+  });
+
+  const rawText = response.text?.trim();
+  if (!rawText) {
+    throw new Error('Gemini returned empty content.');
+  }
+
+  const parsed = extractJsonObject(rawText);
+  if (!isValidMoveCoachResponse(parsed)) {
+    throw new Error('Gemini response schema mismatch.');
+  }
+
+  return parsed;
+}
+
+async function callGeminiGameSummary(promptText: string): Promise<GameCoachSummaryResponse> {
+  const ai = getGeminiClient();
+  if (!ai) {
+    throw new Error('Gemini API key is not configured.');
+  }
+
+  const response = await ai.models.generateContent({
+    model: GEMINI_MODEL,
+    contents: promptText,
+    config: {
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          headline: { type: Type.STRING },
+          strengths: { type: Type.ARRAY, items: { type: Type.STRING } },
+          keyTakeaway: { type: Type.STRING },
+          nextDrill: { type: Type.STRING },
+        },
+        required: ['headline', 'strengths', 'keyTakeaway', 'nextDrill'],
+      },
+    },
+  });
+
+  const rawText = response.text?.trim();
+  if (!rawText) {
+    throw new Error('Gemini returned empty content.');
+  }
+
+  const parsed = extractJsonObject(rawText);
+  if (!isValidGameCoachSummaryResponse(parsed)) {
+    throw new Error('Gemini response schema mismatch.');
+  }
+
+  return parsed;
+}
+
+function heuristicMoveResponse(body: AnalyzeMoveRequestBody, continuationLine: string[]): Record<string, unknown> {
+  return {
+    whatPlayed: `You played ${body.sanPlayed}.`,
+    strongerMove: `A stronger move was ${body.bestSan}.`,
+    whyBetter: `Playing ${body.bestSan} improves piece activity and avoids avoidable tactical and positional concessions.`,
+    category: 'Position',
+    principle: 'Sound Piece Coordination',
+    consequenceSummary: `Following ${continuationLine.join(' ')} gives a stable continuation with practical chances.`,
+    hint: 'Look for a move that improves coordination and increases pressure on key central squares.',
+  };
+}
+
+function heuristicGameSummaryResponse(body: GameCoachSummaryRequestBody): Record<string, unknown> {
+  const playerColor = body.playerColor || 'w';
+  const accuracy = playerColor === 'w' ? body.whiteAccuracy : body.blackAccuracy;
+  return {
+    headline: `Good effort — you finished with ${accuracy}% accuracy over ${body.movesCount} moves.`,
+    strengths: [
+      `You found ${body.bestMoveCount} best moves and kept active piece play for long stretches.`,
+      `You maintained practical fighting chances despite ${body.mistakeCount + body.blunderCount} major slips.`,
+    ],
+    keyTakeaway: 'Before every move, quickly compare your candidate with the safest active alternative to reduce large evaluation swings.',
+    nextDrill: 'Tactical blunder-check routine (checks, captures, threats) before committing each move.',
+  };
+}
+
+app.get('/api/health', (_req: Request, res: Response) => {
   res.json({
     status: 'ok',
     hasGeminiKey: !!process.env.GEMINI_API_KEY,
@@ -36,299 +281,328 @@ app.get('/api/health', (req: Request, res: Response) => {
   });
 });
 
-// Test NVIDIA NIM API Key
 app.post('/api/ai/test-nim', async (req: Request, res: Response) => {
   try {
-    const { apiKey, model = 'meta/llama-3.1-70b-instruct' } = req.body;
+    const { apiKey, model = DEFAULT_NIM_MODEL } = req.body as { apiKey?: string; model?: string };
     const keyToUse = apiKey || process.env.NVIDIA_NIM_API_KEY;
 
     if (!keyToUse) {
-      return res.status(400).json({ error: 'No NVIDIA NIM API key provided' });
+      return sendValidationError(res, 'MISSING_NIM_KEY', 'NVIDIA NIM API key is required', [
+        { field: 'apiKey', issue: 'provide apiKey in request body or NVIDIA_NIM_API_KEY in environment' },
+      ]);
     }
 
-    const response = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${keyToUse}`,
+    const nimResult = await callNvidiaJson<{ reply: string }>({
+      apiKey: keyToUse,
+      model,
+      systemInstruction: 'Return strict JSON only: {"reply":"..."}',
+      prompt: 'Reply with JSON containing a short connectivity confirmation message.',
+      maxTokens: 80,
+      validate: (value: unknown): value is { reply: string } => {
+        return typeof value === 'object' && value !== null && typeof (value as { reply?: unknown }).reply === 'string';
       },
-      body: JSON.stringify({
-        model: model,
-        messages: [{ role: 'user', content: 'Say "NVIDIA NIM Connected!" in 3 words.' }],
-        max_tokens: 30,
-        temperature: 0.2,
-      }),
     });
 
-    if (!response.ok) {
-      const errText = await response.text();
-      return res.status(response.status).json({ error: `NVIDIA API error: ${errText}` });
+    if (nimResult.ok === false) {
+      return res.status(nimResult.error.status ?? 502).json({
+        error: nimResult.error.message,
+        code: nimResult.error.code,
+        details: [
+          {
+            field: 'nvidia',
+            issue: nimResult.error.diagnostic || 'NVIDIA NIM request failed',
+          },
+        ],
+      });
     }
 
-    const data = await response.json();
-    const reply = data.choices?.[0]?.message?.content || 'Connected successfully!';
-    return res.json({ success: true, model, reply });
+    return res.json({ success: true, model, reply: nimResult.data.reply, warnings: nimResult.warnings });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Unknown error';
-    return res.status(500).json({ error: message });
+    return res.status(500).json({ error: message, code: 'NIM_TEST_FAILED', details: [] });
   }
 });
 
-// AI Move Deep Analysis Coach endpoint (Supports Gemini and NVIDIA NIM)
 app.post('/api/ai/analyze-move', async (req: Request, res: Response) => {
   try {
-    const {
-      provider = 'gemini',
-      nvidiaApiKey,
-      nvidiaModel = 'meta/llama-3.1-70b-instruct',
-      fenBefore,
-      color,
-      sanPlayed,
-      bestSan,
-      classification,
-      evalLossCp,
-      evalBefore,
-      evalAfter,
-      consequenceLine,
-      coachPersona = 'encouraging',
-    } = req.body;
+    const validated = validateAnalyzeMoveRequest(req.body);
+    if (validated.ok === false) {
+      return res.status(400).json(validated.error);
+    }
+
+    const body = validated.value;
+    const chess = createChessFromFen(body.fenBefore);
+    if (!chess) {
+      return sendValidationError(res, 'INVALID_FEN', 'Invalid chess position', [
+        { field: 'fenBefore', issue: 'must be a valid FEN position' },
+      ]);
+    }
+
+    const playedLegality = ensureLegalMove(body.fenBefore, body.sanPlayed, 'sanPlayed');
+    if (playedLegality.ok === false) {
+      return sendValidationError(res, 'ILLEGAL_MOVE', 'Invalid chess move for provided position', [playedLegality.detail]);
+    }
+
+    const bestLegality = ensureLegalMove(body.fenBefore, body.bestSan, 'bestSan');
+    if (bestLegality.ok === false) {
+      return sendValidationError(res, 'ILLEGAL_MOVE', 'Invalid chess move for provided position', [bestLegality.detail]);
+    }
+
+    const sanitizedLineResult = sanitizeConsequenceLine(body.fenBefore, body.consequenceLine);
+    const continuationLine = sanitizedLineResult.line.length > 0 ? sanitizedLineResult.line : [body.bestSan];
+
+    const deterministic = buildDeterministicMoveContext({
+      color: body.color,
+      sanPlayed: body.sanPlayed,
+      bestSan: body.bestSan,
+      evalBefore: body.evalBefore,
+      evalAfter: body.evalAfter,
+      evalLossCp: body.evalLossCp,
+    });
 
     const personaInstructions: Record<string, string> = {
-      encouraging: 'You are a warm, supportive, master chess coach who encourages the student while giving crystal-clear tactical and positional insights.',
-      strict: 'You are a disciplined Grandmaster coach who cuts straight to the tactical truth and expects disciplined play.',
-      tactical: 'You are an energetic tactical trainer focusing heavily on spotting pins, forks, discovered attacks, and piece vulnerabilities.',
-      friendly: 'You are a friendly club coach explaining chess in simple, memorable, intuitive concepts.',
+      encouraging:
+        'You are a warm and supportive master chess coach who encourages improvement while staying concrete and accurate.',
+      strict: 'You are a disciplined grandmaster coach who is direct and uncompromising about tactical truth.',
+      tactical:
+        'You are an energetic tactical trainer focusing on checks, captures, threats, and tactical motifs like forks, pins, and discovered attacks.',
+      friendly: 'You are a friendly club coach who explains ideas in simple, memorable language.',
     };
 
     const promptText = `
 You are an expert AI Chess Coach reviewing a student's move.
+
 Context:
-- Position FEN: ${fenBefore}
-- Player color: ${color === 'w' ? 'White' : 'Black'}
-- Move Played: ${sanPlayed}
-- Engine Best Move: ${bestSan}
-- Classification: ${classification}
-- Evaluation swing: ${(evalLossCp / 100).toFixed(2)} pawns
-- Eval before: ${(evalBefore / 100).toFixed(2)}, Eval after: ${(evalAfter / 100).toFixed(2)}
-- Engine Continuation: ${consequenceLine ? consequenceLine.join(' ') : bestSan}
+- Position FEN: ${body.fenBefore}
+- Player color: ${body.color === 'w' ? 'White' : 'Black'}
+- Move played: ${body.sanPlayed}
+- Engine best move: ${body.bestSan}
+- Existing classification label: ${body.classification || 'N/A'}
+- Evaluation swing from move loss: ${formatEvalPawns(body.evalLossCp)} pawns
+- Eval before: ${formatEvalPawns(body.evalBefore)}, Eval after: ${formatEvalPawns(body.evalAfter)}
+- Engine continuation: ${continuationLine.join(' ')}
+- ${deterministic.preSummary}
 
-Coach Style: ${personaInstructions[coachPersona] || personaInstructions.encouraging}
+Coach style: ${personaInstructions[body.coachPersona || 'encouraging']}
 
-Please provide a structured coaching response answering these 3 questions clearly for the player:
-1. "whatPlayed": Explain what the player's move did and what flaw/risk it created (1-2 sentences).
-2. "strongerMove": State why the recommended move ${bestSan} is stronger (1-2 sentences).
-3. "whyBetter": The deep tactical or positional reasoning behind why ${bestSan} works and what principle applies (2-3 sentences).
-4. "category": Choose one of ["Tactical", "Material", "King Safety", "Development", "Position", "Tempo", "Opportunity", "Endgame"].
-5. "principle": A concise named chess principle (e.g. "Overloaded Defender", "Pawn Structure Vulnerability", "King Exposure").
-6. "consequenceSummary": What could or did happen following the continuation line (1-2 sentences).
-7. "hint": A subtle interactive puzzle hint for the player trying to find the best move on the board WITHOUT giving away the exact move notation directly (e.g. "Look for a way your bishop can exploit the weakened f7 square").
+Return strict JSON only with these keys:
+1) whatPlayed: Explain what the played move did and which risk or flaw it introduced (1-2 sentences).
+2) strongerMove: Explain why ${body.bestSan} is stronger (1-2 sentences).
+3) whyBetter: Deep tactical/positional reason the best move works better (2-3 sentences).
+4) category: One of ["Tactical", "Material", "King Safety", "Development", "Position", "Tempo", "Opportunity", "Endgame"].
+5) principle: A concise named chess principle.
+6) consequenceSummary: Practical consequence of the continuation line (1-2 sentences).
+7) hint: Subtle board-based hint that does not reveal exact SAN notation directly.
 `;
 
-    // 1. Try NVIDIA NIM if selected or key provided
-    const nimKey = nvidiaApiKey || process.env.NVIDIA_NIM_API_KEY;
-    if (provider === 'nvidia' && nimKey) {
-      const nimResponse = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${nimKey}`,
-        },
-        body: JSON.stringify({
-          model: nvidiaModel,
-          messages: [
-            {
-              role: 'system',
-              content: 'You are a grandmaster chess coach. Always respond in valid strict JSON matching the requested fields: whatPlayed, strongerMove, whyBetter, category, principle, consequenceSummary, hint.',
-            },
-            { role: 'user', content: promptText },
-          ],
-          temperature: 0.4,
-          max_tokens: 600,
-        }),
-      });
+    const warnings = [...sanitizedLineResult.warnings];
+    const requestedProvider = body.provider || 'gemini';
+    let fallbackUsed = false;
+    let fallbackReason: string | null = null;
 
-      if (nimResponse.ok) {
-        const nimData = await nimResponse.json();
-        const content = nimData.choices?.[0]?.message?.content || '';
-        try {
-          const jsonMatch = content.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            const parsed = JSON.parse(jsonMatch[0]);
-            return res.json({
-              ...parsed,
-              source: 'nvidia-nim',
-              model: nvidiaModel,
-            });
-          }
-        } catch {
-          // fallback to text extraction
+    const nimKey = body.nvidiaApiKey || process.env.NVIDIA_NIM_API_KEY;
+    const nimModel = body.nvidiaModel || DEFAULT_NIM_MODEL;
+
+    if (requestedProvider === 'nvidia') {
+      if (!nimKey) {
+        fallbackUsed = true;
+        fallbackReason = 'NVIDIA NIM requested but no API key was configured.';
+        warnings.push(fallbackReason);
+      } else {
+        const nimResult = await callNvidiaJson({
+          apiKey: nimKey,
+          model: nimModel,
+          prompt: promptText,
+          systemInstruction:
+            'You are a grandmaster chess coach. Return strict JSON only with exactly these fields: whatPlayed, strongerMove, whyBetter, category, principle, consequenceSummary, hint. Ensure category uses the allowed enum.',
+          validate: isValidMoveCoachResponse,
+          maxTokens: 700,
+        });
+
+        warnings.push(...nimResult.warnings);
+
+        if (nimResult.ok === true) {
+          return res.json(
+            withProvenance(
+              {
+                ...nimResult.data,
+                deterministicSummary: deterministic.preSummary,
+              },
+              {
+                source: 'nvidia-nim',
+                model: nimModel,
+                fallbackUsed,
+                fallbackReason,
+                warnings,
+              }
+            )
+          );
+        } else {
+          fallbackUsed = true;
+          const nimError = (nimResult as { ok: false; error: { code: string; message: string } }).error;
+          fallbackReason = `${nimError.code}: ${nimError.message}`;
+          warnings.push(`NVIDIA NIM failed: ${nimError.code}`);
         }
       }
     }
 
-    // 2. Try Gemini API
-    const ai = getGeminiClient();
-    if (ai) {
-      const geminiResponse = await ai.models.generateContent({
-        model: 'gemini-3.7-flash',
-        contents: promptText,
-        config: {
-          systemInstruction: 'You are a world-class chess coach. You explain moves with clarity, coaching warmth, and deep tactical understanding.',
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              whatPlayed: { type: Type.STRING },
-              strongerMove: { type: Type.STRING },
-              whyBetter: { type: Type.STRING },
-              category: { 
-                type: Type.STRING, 
-                enum: ['Tactical', 'Material', 'King Safety', 'Development', 'Position', 'Tempo', 'Opportunity', 'Endgame'] 
-              },
-              principle: { type: Type.STRING },
-              consequenceSummary: { type: Type.STRING },
-              hint: { type: Type.STRING },
+    if (requestedProvider !== 'heuristic') {
+      try {
+        const geminiData = await callGeminiMoveCoach(promptText);
+        return res.json(
+          withProvenance(
+            {
+              ...geminiData,
+              deterministicSummary: deterministic.preSummary,
             },
-            required: ['whatPlayed', 'strongerMove', 'whyBetter', 'category', 'principle', 'consequenceSummary', 'hint'],
-          },
-        },
-      });
-
-      if (geminiResponse.text) {
-        const parsed = JSON.parse(geminiResponse.text);
-        return res.json({
-          ...parsed,
-          source: 'gemini',
-          model: 'gemini-3.7-flash',
-        });
+            {
+              source: 'gemini',
+              model: GEMINI_MODEL,
+              fallbackUsed,
+              fallbackReason,
+              warnings,
+            }
+          )
+        );
+      } catch (error) {
+        fallbackUsed = true;
+        const reason = error instanceof Error ? error.message : 'Gemini call failed.';
+        fallbackReason = fallbackReason ?? reason;
+        warnings.push(`Gemini fallback: ${reason}`);
       }
     }
 
-    // 3. Fallback response
-    return res.status(200).json({
-      whatPlayed: `You played ${sanPlayed}.`,
-      strongerMove: `A stronger move was ${bestSan}.`,
-      whyBetter: `Playing ${bestSan} coordinates your pieces more effectively and maintains central presence without incurring unnecessary weaknesses.`,
-      category: 'Position',
-      principle: 'Sound Piece Coordination',
-      consequenceSummary: `Following ${consequenceLine ? consequenceLine.join(' ') : bestSan} gives a balanced, active continuation.`,
-      hint: `Look for a move that controls key central squares or removes opponent tension.`,
-      source: 'heuristic',
-    });
+    return res.status(200).json(
+      withProvenance(
+        {
+          ...heuristicMoveResponse(body, continuationLine),
+          deterministicSummary: deterministic.preSummary,
+        },
+        {
+          source: 'heuristic',
+          model: 'deterministic-heuristic-v1',
+          fallbackUsed,
+          fallbackReason,
+          warnings,
+        }
+      )
+    );
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Unknown error';
     console.error('Error analyzing move with AI:', message);
-    return res.status(500).json({ error: message });
+    return res.status(500).json({ error: message, code: 'ANALYZE_MOVE_FAILED', details: [] });
   }
 });
 
-// Full Game AI Coach Summary
 app.post('/api/ai/game-coach-summary', async (req: Request, res: Response) => {
   try {
-    const {
-      whiteAccuracy,
-      blackAccuracy,
-      playerColor = 'w',
-      movesCount,
-      blunderCount,
-      mistakeCount,
-      bestMoveCount,
-      pgn,
-      provider = 'gemini',
-      nvidiaApiKey,
-      nvidiaModel = 'meta/llama-3.1-70b-instruct',
-    } = req.body;
+    const validated = validateGameCoachSummaryRequest(req.body);
+    if (validated.ok === false) {
+      return res.status(400).json(validated.error);
+    }
+
+    const body = validated.value;
+    const playerColor = body.playerColor || 'w';
 
     const promptText = `
 You are a master chess coach providing a final comprehensive debrief after a completed chess game.
+
 Student stats:
 - Color: ${playerColor === 'w' ? 'White' : 'Black'}
-- Accuracy: ${playerColor === 'w' ? whiteAccuracy : blackAccuracy}% (Opponent: ${playerColor === 'w' ? blackAccuracy : whiteAccuracy}%)
-- Total Moves: ${movesCount}
-- Blunders: ${blunderCount}, Mistakes: ${mistakeCount}, Best Moves: ${bestMoveCount}
-- Game PGN: ${pgn || 'N/A'}
+- Accuracy: ${playerColor === 'w' ? body.whiteAccuracy : body.blackAccuracy}% (Opponent: ${
+      playerColor === 'w' ? body.blackAccuracy : body.whiteAccuracy
+    }%)
+- Total Moves: ${body.movesCount}
+- Blunders: ${body.blunderCount}, Mistakes: ${body.mistakeCount}, Best Moves: ${body.bestMoveCount}
+- Game PGN: ${body.pgn || 'N/A'}
 
-Provide:
-1. "headline": An encouraging 1-sentence headline summarizing the performance.
-2. "strengths": 2 bullet points on what the student did well.
-3. "keyTakeaway": The #1 tactical or strategic lesson from this game to remember for future matches.
-4. "nextDrill": A recommended training focus (e.g. "Defending against pins", "King safety in open files", "Knight outposts").
+Return strict JSON only with these keys:
+1) headline: One encouraging sentence summarizing performance.
+2) strengths: Exactly 2 concise bullet-friendly strings describing what went well.
+3) keyTakeaway: The single biggest tactical or strategic lesson.
+4) nextDrill: A specific training focus for the next practice block.
 `;
 
-    const nimKey = nvidiaApiKey || process.env.NVIDIA_NIM_API_KEY;
-    if (provider === 'nvidia' && nimKey) {
-      const nimResponse = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${nimKey}`,
-        },
-        body: JSON.stringify({
-          model: nvidiaModel,
-          messages: [
-            { role: 'system', content: 'You are a grandmaster chess coach. Return valid JSON.' },
-            { role: 'user', content: promptText },
-          ],
-          temperature: 0.4,
-          max_tokens: 500,
-        }),
-      });
+    const warnings: string[] = [];
+    const requestedProvider = body.provider || 'gemini';
+    let fallbackUsed = false;
+    let fallbackReason: string | null = null;
 
-      if (nimResponse.ok) {
-        const nimData = await nimResponse.json();
-        const content = nimData.choices?.[0]?.message?.content || '';
-        try {
-          const jsonMatch = content.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            return res.json(JSON.parse(jsonMatch[0]));
-          }
-        } catch {
-          // ignore
+    const nimKey = body.nvidiaApiKey || process.env.NVIDIA_NIM_API_KEY;
+    const nimModel = body.nvidiaModel || DEFAULT_NIM_MODEL;
+
+    if (requestedProvider === 'nvidia') {
+      if (!nimKey) {
+        fallbackUsed = true;
+        fallbackReason = 'NVIDIA NIM requested but no API key was configured.';
+        warnings.push(fallbackReason);
+      } else {
+        const nimResult = await callNvidiaJson({
+          apiKey: nimKey,
+          model: nimModel,
+          prompt: promptText,
+          systemInstruction:
+            'You are a grandmaster chess coach. Return strict JSON only with keys: headline, strengths, keyTakeaway, nextDrill. strengths must be an array of strings.',
+          validate: isValidGameCoachSummaryResponse,
+          maxTokens: 550,
+        });
+
+        warnings.push(...nimResult.warnings);
+
+        if (nimResult.ok === true) {
+          return res.json(
+            withProvenance(nimResult.data, {
+              source: 'nvidia-nim',
+              model: nimModel,
+              fallbackUsed,
+              fallbackReason,
+              warnings,
+            })
+          );
+        } else {
+          fallbackUsed = true;
+          const nimError = (nimResult as { ok: false; error: { code: string; message: string } }).error;
+          fallbackReason = `${nimError.code}: ${nimError.message}`;
+          warnings.push(`NVIDIA NIM failed: ${nimError.code}`);
         }
       }
     }
 
-    const ai = getGeminiClient();
-    if (ai) {
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.7-flash',
-        contents: promptText,
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              headline: { type: Type.STRING },
-              strengths: { type: Type.ARRAY, items: { type: Type.STRING } },
-              keyTakeaway: { type: Type.STRING },
-              nextDrill: { type: Type.STRING },
-            },
-            required: ['headline', 'strengths', 'keyTakeaway', 'nextDrill'],
-          },
-        },
-      });
-
-      if (response.text) {
-        return res.json(JSON.parse(response.text));
+    if (requestedProvider !== 'heuristic') {
+      try {
+        const geminiData = await callGeminiGameSummary(promptText);
+        return res.json(
+          withProvenance(geminiData, {
+            source: 'gemini',
+            model: GEMINI_MODEL,
+            fallbackUsed,
+            fallbackReason,
+            warnings,
+          })
+        );
+      } catch (error) {
+        fallbackUsed = true;
+        const reason = error instanceof Error ? error.message : 'Gemini call failed.';
+        fallbackReason = fallbackReason ?? reason;
+        warnings.push(`Gemini fallback: ${reason}`);
       }
     }
 
-    return res.json({
-      headline: `Great game! You achieved ${playerColor === 'w' ? whiteAccuracy : blackAccuracy}% accuracy across ${movesCount} moves.`,
-      strengths: [
-        `Executed ${bestMoveCount} engine-approved best moves with strong opening play.`,
-        'Demonstrated active piece mobilization throughout the middlegame.',
-      ],
-      keyTakeaway: 'Always pause before pawn moves to check which defensive squares and pieces they leave behind.',
-      nextDrill: 'Middlegame piece coordination & tactical defense',
-    });
+    return res.json(
+      withProvenance(heuristicGameSummaryResponse(body), {
+        source: 'heuristic',
+        model: 'deterministic-heuristic-v1',
+        fallbackUsed,
+        fallbackReason,
+        warnings,
+      })
+    );
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Unknown error';
-    return res.status(500).json({ error: message });
+    return res.status(500).json({ error: message, code: 'GAME_SUMMARY_FAILED', details: [] });
   }
 });
 
-// Vite middleware for development & static serving for production
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
@@ -339,7 +613,7 @@ async function startServer() {
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*', (req: Request, res: Response) => {
+    app.get('*', (_req: Request, res: Response) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
