@@ -1,48 +1,28 @@
 import express, { Request, Response } from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
-import { GoogleGenAI, Type } from '@google/genai';
 import { Chess } from 'chess.js';
 import dotenv from 'dotenv';
 import {
   AnalyzeMoveRequestBody,
   GameCoachSummaryRequestBody,
-  GameCoachSummaryResponse,
-  MoveCoachResponse,
-  getMoveCategories,
   isValidGameCoachSummaryResponse,
   isValidMoveCoachResponse,
   validateAnalyzeMoveRequest,
   validateGameCoachSummaryRequest,
 } from './src/engine/apiValidation';
-import { callNvidiaJson, extractJsonObject } from './src/engine/aiProvider';
+import { callNvidiaJson } from './src/engine/aiProvider';
 
 dotenv.config();
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
-const DEFAULT_NIM_MODEL = 'meta/llama-3.1-70b-instruct';
-const GEMINI_MODEL = 'gemini-3.7-flash';
+const DEFAULT_NIM_MODEL = 'nvidia/nemotron-3.5-lightning-30b-a3b';
 
 app.use(express.json());
 
-let geminiClient: GoogleGenAI | null = null;
-function getGeminiClient(): GoogleGenAI | null {
-  if (!geminiClient && process.env.GEMINI_API_KEY) {
-    geminiClient = new GoogleGenAI({
-      apiKey: process.env.GEMINI_API_KEY,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        },
-      },
-    });
-  }
-  return geminiClient;
-}
-
-type ProviderSource = 'nvidia-nim' | 'gemini' | 'heuristic';
+type ProviderSource = 'nvidia-nim' | 'heuristic';
 
 interface ProvenanceMeta {
   source: ProviderSource;
@@ -165,88 +145,6 @@ function sanitizeConsequenceLine(fenBefore: string, line: string[] | undefined):
   return { line: sanitized, warnings };
 }
 
-async function callGeminiMoveCoach(promptText: string): Promise<MoveCoachResponse> {
-  const ai = getGeminiClient();
-  if (!ai) {
-    throw new Error('Gemini API key is not configured.');
-  }
-
-  const response = await ai.models.generateContent({
-    model: GEMINI_MODEL,
-    contents: promptText,
-    config: {
-      systemInstruction:
-        'You are a world-class chess coach. Reply in strict JSON only, following the requested keys and category enum exactly.',
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          whatPlayed: { type: Type.STRING },
-          strongerMove: { type: Type.STRING },
-          whyBetter: { type: Type.STRING },
-          category: {
-            type: Type.STRING,
-            enum: [...getMoveCategories()],
-          },
-          principle: { type: Type.STRING },
-          consequenceSummary: { type: Type.STRING },
-          hint: { type: Type.STRING },
-        },
-        required: ['whatPlayed', 'strongerMove', 'whyBetter', 'category', 'principle', 'consequenceSummary', 'hint'],
-      },
-    },
-  });
-
-  const rawText = response.text?.trim();
-  if (!rawText) {
-    throw new Error('Gemini returned empty content.');
-  }
-
-  const parsed = extractJsonObject(rawText);
-  if (!isValidMoveCoachResponse(parsed)) {
-    throw new Error('Gemini response schema mismatch.');
-  }
-
-  return parsed;
-}
-
-async function callGeminiGameSummary(promptText: string): Promise<GameCoachSummaryResponse> {
-  const ai = getGeminiClient();
-  if (!ai) {
-    throw new Error('Gemini API key is not configured.');
-  }
-
-  const response = await ai.models.generateContent({
-    model: GEMINI_MODEL,
-    contents: promptText,
-    config: {
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          headline: { type: Type.STRING },
-          strengths: { type: Type.ARRAY, items: { type: Type.STRING } },
-          keyTakeaway: { type: Type.STRING },
-          nextDrill: { type: Type.STRING },
-        },
-        required: ['headline', 'strengths', 'keyTakeaway', 'nextDrill'],
-      },
-    },
-  });
-
-  const rawText = response.text?.trim();
-  if (!rawText) {
-    throw new Error('Gemini returned empty content.');
-  }
-
-  const parsed = extractJsonObject(rawText);
-  if (!isValidGameCoachSummaryResponse(parsed)) {
-    throw new Error('Gemini response schema mismatch.');
-  }
-
-  return parsed;
-}
-
 function heuristicMoveResponse(body: AnalyzeMoveRequestBody, continuationLine: string[]): Record<string, unknown> {
   return {
     whatPlayed: `You played ${body.sanPlayed}.`,
@@ -276,19 +174,18 @@ function heuristicGameSummaryResponse(body: GameCoachSummaryRequestBody): Record
 app.get('/api/health', (_req: Request, res: Response) => {
   res.json({
     status: 'ok',
-    hasGeminiKey: !!process.env.GEMINI_API_KEY,
     hasNvidiaKey: !!process.env.NVIDIA_NIM_API_KEY,
   });
 });
 
 app.post('/api/ai/test-nim', async (req: Request, res: Response) => {
   try {
-    const { apiKey, model = DEFAULT_NIM_MODEL } = req.body as { apiKey?: string; model?: string };
-    const keyToUse = apiKey || process.env.NVIDIA_NIM_API_KEY;
+    const { model = DEFAULT_NIM_MODEL } = req.body as { model?: string };
+    const keyToUse = process.env.NVIDIA_NIM_API_KEY;
 
     if (!keyToUse) {
       return sendValidationError(res, 'MISSING_NIM_KEY', 'NVIDIA NIM API key is required', [
-        { field: 'apiKey', issue: 'provide apiKey in request body or NVIDIA_NIM_API_KEY in environment' },
+        { field: 'NVIDIA_NIM_API_KEY', issue: 'set NVIDIA_NIM_API_KEY in environment' },
       ]);
     }
 
@@ -396,11 +293,11 @@ Return strict JSON only with these keys:
 `;
 
     const warnings = [...sanitizedLineResult.warnings];
-    const requestedProvider = body.provider || 'gemini';
+    const requestedProvider = body.provider || 'nvidia';
     let fallbackUsed = false;
     let fallbackReason: string | null = null;
 
-    const nimKey = body.nvidiaApiKey || process.env.NVIDIA_NIM_API_KEY;
+    const nimKey = process.env.NVIDIA_NIM_API_KEY;
     const nimModel = body.nvidiaModel || DEFAULT_NIM_MODEL;
 
     if (requestedProvider === 'nvidia') {
@@ -416,6 +313,8 @@ Return strict JSON only with these keys:
           systemInstruction:
             'You are a grandmaster chess coach. Return strict JSON only with exactly these fields: whatPlayed, strongerMove, whyBetter, category, principle, consequenceSummary, hint. Ensure category uses the allowed enum.',
           validate: isValidMoveCoachResponse,
+          topP: 0.95,
+          reasoningBudget: 16384,
           maxTokens: 700,
         });
 
@@ -443,32 +342,6 @@ Return strict JSON only with these keys:
           fallbackReason = `${nimError.code}: ${nimError.message}`;
           warnings.push(`NVIDIA NIM failed: ${nimError.code}`);
         }
-      }
-    }
-
-    if (requestedProvider !== 'heuristic') {
-      try {
-        const geminiData = await callGeminiMoveCoach(promptText);
-        return res.json(
-          withProvenance(
-            {
-              ...geminiData,
-              deterministicSummary: deterministic.preSummary,
-            },
-            {
-              source: 'gemini',
-              model: GEMINI_MODEL,
-              fallbackUsed,
-              fallbackReason,
-              warnings,
-            }
-          )
-        );
-      } catch (error) {
-        fallbackUsed = true;
-        const reason = error instanceof Error ? error.message : 'Gemini call failed.';
-        fallbackReason = fallbackReason ?? reason;
-        warnings.push(`Gemini fallback: ${reason}`);
       }
     }
 
@@ -524,11 +397,11 @@ Return strict JSON only with these keys:
 `;
 
     const warnings: string[] = [];
-    const requestedProvider = body.provider || 'gemini';
+    const requestedProvider = body.provider || 'nvidia';
     let fallbackUsed = false;
     let fallbackReason: string | null = null;
 
-    const nimKey = body.nvidiaApiKey || process.env.NVIDIA_NIM_API_KEY;
+    const nimKey = process.env.NVIDIA_NIM_API_KEY;
     const nimModel = body.nvidiaModel || DEFAULT_NIM_MODEL;
 
     if (requestedProvider === 'nvidia') {
@@ -544,6 +417,8 @@ Return strict JSON only with these keys:
           systemInstruction:
             'You are a grandmaster chess coach. Return strict JSON only with keys: headline, strengths, keyTakeaway, nextDrill. strengths must be an array of strings.',
           validate: isValidGameCoachSummaryResponse,
+          topP: 0.95,
+          reasoningBudget: 16384,
           maxTokens: 550,
         });
 
@@ -565,26 +440,6 @@ Return strict JSON only with these keys:
           fallbackReason = `${nimError.code}: ${nimError.message}`;
           warnings.push(`NVIDIA NIM failed: ${nimError.code}`);
         }
-      }
-    }
-
-    if (requestedProvider !== 'heuristic') {
-      try {
-        const geminiData = await callGeminiGameSummary(promptText);
-        return res.json(
-          withProvenance(geminiData, {
-            source: 'gemini',
-            model: GEMINI_MODEL,
-            fallbackUsed,
-            fallbackReason,
-            warnings,
-          })
-        );
-      } catch (error) {
-        fallbackUsed = true;
-        const reason = error instanceof Error ? error.message : 'Gemini call failed.';
-        fallbackReason = fallbackReason ?? reason;
-        warnings.push(`Gemini fallback: ${reason}`);
       }
     }
 

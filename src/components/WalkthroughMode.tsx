@@ -203,7 +203,6 @@ export const WalkthroughMode: React.FC<WalkthroughModeProps> = ({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           provider: settings.provider,
-          nvidiaApiKey: settings.nvidiaApiKey,
           nvidiaModel: settings.nvidiaModel,
           coachPersona: settings.coachPersona,
           fenBefore: currentMove.fenBefore,

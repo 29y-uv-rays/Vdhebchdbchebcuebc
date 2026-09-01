@@ -30,8 +30,7 @@ const MOVE_CATEGORIES = [
 type MoveCategory = typeof MOVE_CATEGORIES[number];
 
 export interface AnalyzeMoveRequestBody {
-  provider?: 'gemini' | 'nvidia' | 'heuristic';
-  nvidiaApiKey?: string;
+  provider?: 'nvidia' | 'heuristic';
   nvidiaModel?: string;
   fenBefore: string;
   color: 'w' | 'b';
@@ -54,8 +53,7 @@ export interface GameCoachSummaryRequestBody {
   mistakeCount: number;
   bestMoveCount: number;
   pgn?: string;
-  provider?: 'gemini' | 'nvidia' | 'heuristic';
-  nvidiaApiKey?: string;
+  provider?: 'nvidia' | 'heuristic';
   nvidiaModel?: string;
 }
 
@@ -153,8 +151,8 @@ export function validateAnalyzeMoveRequest(body: unknown): ValidationResult<Anal
   }
 
   const provider = body.provider;
-  if (provider !== undefined && provider !== 'gemini' && provider !== 'nvidia' && provider !== 'heuristic') {
-    details.push({ field: 'provider', issue: 'must be one of "gemini", "nvidia", "heuristic"' });
+  if (provider !== undefined && provider !== 'nvidia' && provider !== 'heuristic') {
+    details.push({ field: 'provider', issue: 'must be one of "nvidia", "heuristic"' });
   }
 
   const coachPersona = body.coachPersona;
@@ -183,7 +181,6 @@ export function validateAnalyzeMoveRequest(body: unknown): ValidationResult<Anal
     ok: true,
     value: {
       provider: provider as AnalyzeMoveRequestBody['provider'],
-      nvidiaApiKey: typeof body.nvidiaApiKey === 'string' ? body.nvidiaApiKey : undefined,
       nvidiaModel: typeof body.nvidiaModel === 'string' && body.nvidiaModel.trim() ? body.nvidiaModel.trim() : undefined,
       fenBefore,
       color: color as 'w' | 'b',
@@ -222,8 +219,8 @@ export function validateGameCoachSummaryRequest(body: unknown): ValidationResult
   }
 
   const provider = body.provider;
-  if (provider !== undefined && provider !== 'gemini' && provider !== 'nvidia' && provider !== 'heuristic') {
-    details.push({ field: 'provider', issue: 'must be one of "gemini", "nvidia", "heuristic"' });
+  if (provider !== undefined && provider !== 'nvidia' && provider !== 'heuristic') {
+    details.push({ field: 'provider', issue: 'must be one of "nvidia", "heuristic"' });
   }
 
   if (details.length > 0) {
@@ -242,7 +239,6 @@ export function validateGameCoachSummaryRequest(body: unknown): ValidationResult
       bestMoveCount,
       pgn: typeof body.pgn === 'string' ? body.pgn : undefined,
       provider: provider as GameCoachSummaryRequestBody['provider'],
-      nvidiaApiKey: typeof body.nvidiaApiKey === 'string' ? body.nvidiaApiKey : undefined,
       nvidiaModel: typeof body.nvidiaModel === 'string' && body.nvidiaModel.trim() ? body.nvidiaModel.trim() : undefined,
     },
   };

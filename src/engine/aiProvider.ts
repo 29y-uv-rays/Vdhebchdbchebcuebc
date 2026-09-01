@@ -132,7 +132,9 @@ export async function callNvidiaJson<T>(options: {
   timeoutMs?: number;
   maxAttempts?: number;
   temperature?: number;
+  topP?: number;
   maxTokens?: number;
+  reasoningBudget?: number;
 }): Promise<ProviderResult<T>> {
   const {
     apiKey,
@@ -143,7 +145,9 @@ export async function callNvidiaJson<T>(options: {
     timeoutMs = DEFAULT_TIMEOUT_MS,
     maxAttempts = DEFAULT_MAX_ATTEMPTS,
     temperature = 0.35,
+    topP = 0.95,
     maxTokens = 650,
+    reasoningBudget = 16384,
   } = options;
 
   const warnings: string[] = [];
@@ -171,7 +175,11 @@ export async function callNvidiaJson<T>(options: {
             { role: 'user', content: prompt },
           ],
           temperature,
+          top_p: topP,
           max_tokens: maxTokens,
+          chat_template_kwargs: { enable_thinking: true },
+          reasoning_budget: reasoningBudget,
+          stream: false,
         }),
       });
       clearTimeout(timeoutId);
