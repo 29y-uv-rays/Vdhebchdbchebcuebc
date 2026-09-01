@@ -94,22 +94,41 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           model: localSettings.nvidiaModel,
         }),
       });
-      const data = await res.json();
-      if (res.ok && data.success) {
+
+      // Read the body as text first so a non-JSON response (proxy error page,
+      // empty body, HTML 404) still surfaces its full contents instead of
+      // throwing a cryptic "Unexpected token" SyntaxError from res.json().
+      const raw = await res.text();
+      let data: unknown = null;
+      let parseError: string | null = null;
+      try {
+        data = raw ? JSON.parse(raw) : null;
+      } catch {
+        parseError = raw;
+      }
+
+      if (res.ok && data !== null && (data as { success?: unknown }).success === true) {
+        const reply = (data as { reply?: unknown }).reply;
         setTestStatus({
           loading: false,
           success: true,
-          message: `Connected successfully! (${data.reply})`,
+          message: `Connected successfully! (${typeof reply === 'string' ? reply : 'ok'})`,
         });
       } else {
+        const parts = [
+          `HTTP ${res.status}`,
+          parseError !== null
+            ? `Non-JSON response: ${parseError.trim().slice(0, 2000) || '(empty body)'}`
+            : formatTestConnectionError(data),
+        ];
         setTestStatus({
           loading: false,
           success: false,
-          message: formatTestConnectionError(data),
+          message: parts.filter((part) => part.length > 0).join(' | '),
         });
       }
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Network error';
+      const message = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
       setTestStatus({ loading: false, success: false, message });
     }
   };

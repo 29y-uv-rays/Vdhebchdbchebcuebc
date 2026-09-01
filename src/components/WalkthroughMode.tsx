@@ -63,6 +63,7 @@ export const WalkthroughMode: React.FC<WalkthroughModeProps> = ({
 
   const [aiLoading, setAiLoading] = useState<boolean>(false);
   const [deepAiExplanation, setDeepAiExplanation] = useState<string | null>(null);
+  const [deepAiError, setDeepAiError] = useState<string | null>(null);
 
   const currentMove: AnalyzedMove | undefined = moves[currentPly];
   const isPlayerMove = currentMove ? currentMove.color === playerColor : false;
@@ -75,6 +76,7 @@ export const WalkthroughMode: React.FC<WalkthroughModeProps> = ({
     setInteractiveBoard(c);
     setShowConsequence(false);
     setDeepAiExplanation(null);
+    setDeepAiError(null);
     setPuzzleState({
       solved: false,
       attempted: false,
@@ -197,6 +199,7 @@ export const WalkthroughMode: React.FC<WalkthroughModeProps> = ({
   // Request deep AI coaching explanation
   const handleAskAiCoach = async () => {
     setAiLoading(true);
+    setDeepAiError(null);
     try {
       const res = await fetch('/api/ai/analyze-move', {
         method: 'POST',
@@ -217,14 +220,41 @@ export const WalkthroughMode: React.FC<WalkthroughModeProps> = ({
         }),
       });
 
-      const data = await res.json();
-      if (data.whyBetter) {
-        setDeepAiExplanation(
-          `${data.whatPlayed} ${data.whyBetter} (Principle: ${data.principle || 'Sound Play'})`
-        );
+      const raw = await res.text();
+      let data: unknown = null;
+      let parseError: string | null = null;
+      try {
+        data = raw ? JSON.parse(raw) : null;
+      } catch {
+        parseError = raw;
       }
-    } catch {
-      setDeepAiExplanation(currentMove.explanation?.whyBetter || 'AI Coach analysis unavailable.');
+
+      const payload = data && typeof data === 'object' ? data as Record<string, unknown> : null;
+      if (res.ok && typeof payload?.whyBetter === 'string') {
+        setDeepAiExplanation(
+          `${typeof payload.whatPlayed === 'string' ? payload.whatPlayed : ''} ${payload.whyBetter} (Principle: ${typeof payload.principle === 'string' ? payload.principle : 'Sound Play'})`.trim()
+        );
+      } else {
+        const details = Array.isArray(payload?.details)
+          ? payload.details.map((item) => {
+              if (typeof item === 'string') return item;
+              if (item && typeof item === 'object') {
+                const detail = item as { field?: unknown; issue?: unknown };
+                return typeof detail.field === 'string' && typeof detail.issue === 'string'
+                  ? `${detail.field}: ${detail.issue}`
+                  : JSON.stringify(item);
+              }
+              return String(item);
+            }).join(' | ')
+          : '';
+        const serverError = typeof payload?.error === 'string' ? payload.error : '';
+        const diagnostic = typeof payload?.diagnostic === 'string' ? payload.diagnostic : '';
+        const bodyText = parseError !== null ? parseError.trim().slice(0, 3000) : [serverError, diagnostic, details].filter(Boolean).join(' | ');
+        setDeepAiError(`HTTP ${res.status}: ${bodyText || 'AI Coach returned an empty error response.'}`);
+      }
+    } catch (error: unknown) {
+      const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+      setDeepAiError(message);
     } finally {
       setAiLoading(false);
     }
@@ -490,6 +520,11 @@ export const WalkthroughMode: React.FC<WalkthroughModeProps> = ({
               {deepAiExplanation && (
                 <div className="mt-2 pt-2 border-t border-slate-800 text-indigo-300 text-xs italic">
                   💡 Deep Coach Insight: {deepAiExplanation}
+                </div>
+              )}
+              {deepAiError && (
+                <div className="mt-2 pt-2 border-t border-rose-500/30 text-rose-300 text-xs whitespace-pre-wrap break-words">
+                  <strong>AI Coach error:</strong> {deepAiError}
                 </div>
               )}
             </div>
