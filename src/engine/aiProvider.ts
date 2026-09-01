@@ -31,8 +31,29 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function getDiagnosticSnippet(raw: string): string {
-  return raw.replace(/\s+/g, ' ').trim().slice(0, 320);
+function getDiagnosticText(raw: string): string {
+  return raw.trim().slice(0, 10000);
+}
+
+function getErrorDiagnostic(error: unknown): string | undefined {
+  if (!(error instanceof Error)) return undefined;
+
+  const cause =
+    error.cause === undefined
+      ? undefined
+      : typeof error.cause === 'string'
+        ? error.cause
+        : (() => {
+            try {
+              return JSON.stringify(error.cause);
+            } catch {
+              return String(error.cause);
+            }
+          })();
+
+  return [error.stack, cause ? `Cause: ${cause}` : null]
+    .filter((part): part is string => typeof part === 'string' && part.length > 0)
+    .join('\n');
 }
 
 function isAbortError(error: unknown): boolean {
@@ -192,7 +213,7 @@ export async function callNvidiaJson<T>(options: {
             : 'NIM_HTTP_ERROR',
           message: `NVIDIA NIM returned status ${response.status}.`,
           status: response.status,
-          diagnostic: getDiagnosticSnippet(errorText),
+          diagnostic: getDiagnosticText(errorText),
         };
         if (RETRYABLE_STATUSES.has(response.status) && attempt < maxAttempts) {
           warnings.push(`NVIDIA NIM retry ${attempt}/${maxAttempts} after HTTP ${response.status}.`);
@@ -227,7 +248,7 @@ export async function callNvidiaJson<T>(options: {
           error: {
             code: 'NIM_INVALID_JSON',
             message: error instanceof Error ? error.message : 'Failed to parse model JSON response.',
-            diagnostic: getDiagnosticSnippet(content),
+            diagnostic: getDiagnosticText(content),
           },
         };
       }
@@ -240,7 +261,7 @@ export async function callNvidiaJson<T>(options: {
           error: {
             code: 'NIM_SCHEMA_MISMATCH',
             message: 'NVIDIA NIM response JSON did not match expected schema.',
-            diagnostic: getDiagnosticSnippet(content),
+            diagnostic: getDiagnosticText(content),
           },
         };
       }
@@ -252,6 +273,7 @@ export async function callNvidiaJson<T>(options: {
       lastError = {
         code: isAbortError(error) ? 'NIM_TIMEOUT' : 'NIM_NETWORK_ERROR',
         message: error instanceof Error ? error.message : 'NVIDIA NIM network request failed.',
+        diagnostic: getErrorDiagnostic(error),
       };
       if (retryable && attempt < maxAttempts) {
         warnings.push(`NVIDIA NIM retry ${attempt}/${maxAttempts} after ${lastError.code}.`);

@@ -38,29 +38,48 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   if (!isOpen) return null;
 
   const formatTestConnectionError = (data: unknown): string => {
-    if (typeof data !== 'object' || data === null) return 'Connection failed';
+    const stringify = (value: unknown): string | null => {
+      if (value === null || value === undefined) return null;
+      if (typeof value === 'string') return value;
+      try {
+        return JSON.stringify(value, null, 2);
+      } catch {
+        return String(value);
+      }
+    };
+
+    if (typeof data !== 'object' || data === null) return stringify(data) || 'Connection failed';
 
     const payload = data as {
       error?: unknown;
+      message?: unknown;
       code?: unknown;
       details?: unknown;
+      diagnostic?: unknown;
     };
 
-    const error = typeof payload.error === 'string' ? payload.error : 'Connection failed';
+    const error = stringify(payload.error) || stringify(payload.message) || 'Connection failed';
     const code = typeof payload.code === 'string' ? payload.code : undefined;
+    const diagnostic = stringify(payload.diagnostic);
 
     const details = Array.isArray(payload.details)
       ? payload.details
           .map((item) => {
-            if (typeof item !== 'object' || item === null) return null;
+            if (typeof item === 'string') return item;
+            if (typeof item !== 'object' || item === null) return stringify(item);
             const detail = item as { field?: unknown; issue?: unknown };
-            if (typeof detail.field !== 'string' || typeof detail.issue !== 'string') return null;
+            if (typeof detail.field !== 'string' || typeof detail.issue !== 'string') return stringify(item);
             return `${detail.field}: ${detail.issue}`;
           })
           .filter((item): item is string => typeof item === 'string' && item.length > 0)
       : [];
 
-    return [error, code ? `Code: ${code}` : null, details.length > 0 ? `Details: ${details.join(' | ')}` : null]
+    return [
+      error,
+      code ? `Code: ${code}` : null,
+      diagnostic ? `Diagnostic: ${diagnostic}` : null,
+      details.length > 0 ? `Details: ${details.join(' | ')}` : null,
+    ]
       .filter((part): part is string => typeof part === 'string' && part.length > 0)
       .join(' | ');
   };
