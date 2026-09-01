@@ -22,7 +22,7 @@ interface ProviderFailure {
 export type ProviderResult<T> = ProviderSuccess<T> | ProviderFailure;
 
 const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
-const NIM_URL = 'https://integrate.api.nvidia.com/v1/chat/completions';
+const NIM_URL = 'https://integrate.api.nvidia.com/v1/';
 const DEFAULT_TIMEOUT_MS = 12000;
 const DEFAULT_MAX_ATTEMPTS = 3;
 const DEFAULT_BACKOFF_MS = 250;
