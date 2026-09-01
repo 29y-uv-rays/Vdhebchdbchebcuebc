@@ -37,6 +37,34 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   if (!isOpen) return null;
 
+  const formatTestConnectionError = (data: unknown): string => {
+    if (typeof data !== 'object' || data === null) return 'Connection failed';
+
+    const payload = data as {
+      error?: unknown;
+      code?: unknown;
+      details?: unknown;
+    };
+
+    const error = typeof payload.error === 'string' ? payload.error : 'Connection failed';
+    const code = typeof payload.code === 'string' ? payload.code : undefined;
+
+    const details = Array.isArray(payload.details)
+      ? payload.details
+          .map((item) => {
+            if (typeof item !== 'object' || item === null) return null;
+            const detail = item as { field?: unknown; issue?: unknown };
+            if (typeof detail.field !== 'string' || typeof detail.issue !== 'string') return null;
+            return `${detail.field}: ${detail.issue}`;
+          })
+          .filter((item): item is string => typeof item === 'string' && item.length > 0)
+      : [];
+
+    return [error, code ? `Code: ${code}` : null, details.length > 0 ? `Details: ${details.join(' | ')}` : null]
+      .filter((part): part is string => typeof part === 'string' && part.length > 0)
+      .join(' | ');
+  };
+
   const handleTestNvidiaKey = async () => {
     setTestStatus({ loading: true });
     try {
@@ -58,7 +86,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         setTestStatus({
           loading: false,
           success: false,
-          message: data.error || 'Connection failed',
+          message: formatTestConnectionError(data),
         });
       }
     } catch (err: unknown) {
@@ -181,7 +209,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     ) : (
                       <AlertCircle className="w-4 h-4 shrink-0" />
                     )}
-                    <span className="truncate max-w-[280px]">{testStatus.message}</span>
+                    <span className="whitespace-pre-wrap break-words">{testStatus.message}</span>
                   </div>
                 )}
               </div>
