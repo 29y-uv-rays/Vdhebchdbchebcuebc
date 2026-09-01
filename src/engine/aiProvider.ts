@@ -223,8 +223,24 @@ export async function callNvidiaJson<T>(options: {
         return { ok: false, error: lastError, model, warnings };
       }
 
-      const body = await response.json();
-      const content = body?.choices?.[0]?.message?.content;
+      const rawResponse = await response.text();
+      let body: unknown;
+      try {
+        body = rawResponse ? JSON.parse(rawResponse) : null;
+      } catch {
+        return {
+          ok: false,
+          model,
+          warnings,
+          error: {
+            code: 'NIM_INVALID_RESPONSE',
+            message: 'NVIDIA NIM returned a non-JSON success response.',
+            diagnostic: getDiagnosticText(rawResponse),
+          },
+        };
+      }
+
+      const content = (body as { choices?: Array<{ message?: { content?: unknown } }> } | null)?.choices?.[0]?.message?.content;
       if (typeof content !== 'string') {
         return {
           ok: false,
@@ -233,6 +249,7 @@ export async function callNvidiaJson<T>(options: {
           error: {
             code: 'NIM_INVALID_RESPONSE',
             message: 'NVIDIA NIM response did not contain text content.',
+            diagnostic: getDiagnosticText(rawResponse),
           },
         };
       }
