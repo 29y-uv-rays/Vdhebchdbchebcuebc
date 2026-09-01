@@ -334,7 +334,7 @@ export const GamePanel: React.FC<GamePanelProps> = ({
         <button
           onClick={onOpenSettings}
           className="p-2 rounded-xl bg-slate-800/80 hover:bg-slate-700/80 border border-slate-700/60 text-slate-300 text-xs font-semibold flex flex-col items-center gap-1 transition-colors cursor-pointer"
-          title="Settings (NVIDIA NIM / Gemini / Style)"
+          title="Settings (NVIDIA NIM / Offline / Style)"
         >
           <SettingsIcon className="w-3.5 h-3.5" />
           <span className="text-[10px]">Config</span>

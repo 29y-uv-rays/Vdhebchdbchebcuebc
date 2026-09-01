@@ -2,21 +2,20 @@
 
 ## Required environment variables
 
-- `GEMINI_API_KEY` (required for Gemini provider fallback/primary usage)
-- `NVIDIA_NIM_API_KEY` (required only when requesting `provider: "nvidia"`)
+- `NVIDIA_NIM_API_KEY` (required for NVIDIA NIM provider)
 - `PORT` (optional; defaults to `3000`)
 
 ## Provider fallback behavior
 
-- `/api/ai/analyze-move` and `/api/ai/game-coach-summary` accept `provider: "nvidia" | "gemini" | "heuristic"`.
-- If `provider: "nvidia"` is requested and NVIDIA fails (network/timeout/429/5xx/schema issues), the backend falls back to Gemini, then heuristic.
+- `/api/ai/analyze-move` and `/api/ai/game-coach-summary` accept `provider: "nvidia" | "heuristic"`.
+- If `provider: "nvidia"` is requested and NVIDIA fails (network/timeout/429/5xx/schema issues), the backend falls back to heuristic.
 - Provider failures are not silent: responses include provenance metadata and fallback reason.
 
 ## Response provenance fields
 
 Both AI endpoints now include:
 
-- `source`: `"nvidia-nim" | "gemini" | "heuristic"`
+- `source`: `"nvidia-nim" | "heuristic"`
 - `model`: model identifier or heuristic label
 - `fallbackUsed`: boolean
 - `fallbackReason`: string or `null`

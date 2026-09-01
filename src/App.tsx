@@ -34,9 +34,8 @@ import {
 } from 'lucide-react';
 
 const DEFAULT_SETTINGS: AISettings = {
-  provider: 'gemini',
-  nvidiaApiKey: '',
-  nvidiaModel: 'meta/llama-3.1-70b-instruct',
+  provider: 'nvidia',
+  nvidiaModel: 'nvidia/nemotron-3.5-lightning-30b-a3b',
   coachPersona: 'encouraging',
   mistakeThresholds: {
     inaccuracy: 0.40,
@@ -57,7 +56,16 @@ export default function App() {
   const [settings, setSettings] = useState<AISettings>(() => {
     const saved = localStorage.getItem('chess_ai_settings');
     if (saved) {
-      try { return JSON.parse(saved); } catch { /* ignore */ }
+      try {
+        const parsed = JSON.parse(saved) as Partial<AISettings> & { provider?: string };
+        return {
+          ...DEFAULT_SETTINGS,
+          ...parsed,
+          provider: parsed.provider === 'heuristic' ? 'heuristic' : 'nvidia',
+        };
+      } catch {
+        /* ignore */
+      }
     }
     return DEFAULT_SETTINGS;
   });

@@ -91,8 +91,7 @@ export interface BotProfile {
 }
 
 export interface AISettings {
-  provider: 'gemini' | 'nvidia' | 'heuristic';
-  nvidiaApiKey: string;
+  provider: 'nvidia' | 'heuristic';
   nvidiaModel: string;
   coachPersona: 'encouraging' | 'strict' | 'tactical' | 'friendly';
   mistakeThresholds: {

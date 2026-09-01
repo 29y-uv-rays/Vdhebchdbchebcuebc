@@ -14,7 +14,8 @@ interface SettingsModalProps {
 }
 
 const POPULAR_NVIDIA_MODELS = [
-  { id: 'meta/llama-3.1-70b-instruct', name: 'Llama 3.1 70B Instruct (Recommended)' },
+  { id: 'nvidia/nemotron-3.5-lightning-30b-a3b', name: 'NVIDIA Nemotron 3.5 Lightning 30B (Recommended)' },
+  { id: 'meta/llama-3.1-70b-instruct', name: 'Llama 3.1 70B Instruct' },
   { id: 'mistralai/mixtral-8x22b-instruct', name: 'Mixtral 8x22B Instruct' },
   { id: 'nvidia/nemotron-4-340b-instruct', name: 'NVIDIA Nemotron-4 340B' },
   { id: 'deepseek-ai/deepseek-r1', name: 'DeepSeek R1' },
@@ -43,7 +44,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          apiKey: localSettings.nvidiaApiKey,
           model: localSettings.nvidiaModel,
         }),
       });
@@ -83,7 +83,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
             <div>
               <h2 className="text-lg font-bold">Game & Coach Settings</h2>
-              <p className="text-xs text-slate-400">Configure AI Providers (NVIDIA NIM / Gemini) & Analysis Sensitivity</p>
+              <p className="text-xs text-slate-400">Configure AI Providers (NVIDIA NIM / Offline) & Analysis Sensitivity</p>
             </div>
           </div>
           <button
@@ -104,7 +104,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </label>
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
               {[
-                { id: 'gemini', title: 'Google Gemini', desc: 'Default server AI with rich structured reasoning' },
                 { id: 'nvidia', title: 'NVIDIA NIM API', desc: 'Custom NVIDIA NIM endpoint & models' },
                 { id: 'heuristic', title: 'Instant Offline Engine', desc: 'Fast rule-based tactical coaching' },
               ].map((prov) => (
@@ -138,24 +137,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
               <div>
                 <label className="text-xs font-medium text-slate-300 block mb-1">
-                  NVIDIA NIM API Key
-                </label>
-                <input
-                  type="password"
-                  value={localSettings.nvidiaApiKey}
-                  onChange={(e) =>
-                    setLocalSettings(s => ({ ...s, nvidiaApiKey: e.target.value }))
-                  }
-                  placeholder="nvapi-..."
-                  className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-xl text-sm text-white focus:outline-none focus:border-indigo-500 font-mono"
-                />
-                <p className="text-[11px] text-slate-400 mt-1">
-                  You can get a free API key from build.nvidia.com. The key is securely passed server-side.
-                </p>
-              </div>
-
-              <div>
-                <label className="text-xs font-medium text-slate-300 block mb-1">
                   NVIDIA Model
                 </label>
                 <select
@@ -178,7 +159,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 <button
                   type="button"
                   onClick={handleTestNvidiaKey}
-                  disabled={testStatus?.loading || !localSettings.nvidiaApiKey}
+                  disabled={testStatus?.loading}
                   className="px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-xs font-semibold rounded-xl border border-slate-700 flex items-center gap-1.5 transition-colors cursor-pointer"
                 >
                   {testStatus?.loading ? (
